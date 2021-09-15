@@ -209,7 +209,7 @@ function _M.transaction()
     end
     
     ffi.gc(ret.transaction,msc.transaction_cleanup)
-    setmetatable(ret,MT)
+    setmetatable(ret,{ __index = MT } )
 
     return ret
 end    
