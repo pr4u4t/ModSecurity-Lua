@@ -146,8 +146,28 @@ function _MT.variable(self,var_name)
 end
 
 function _MT.eval_connection(self,client_ip,client_port,host,port,url,method,version)
-    msc.process_connection(self.transaction, client_ip, client_port, server_ip, server_port);
-    msc.process_uri(self.transaction,url,method, version);
+    
+    if msc.process_connection(self.transaction, client_ip, tonumber(client_port), host, tonumber(port)) ~= 1 then
+	return false, "Failed to process connection"
+    end
+    
+    local v = nil
+    if version == "HTTP/1.0" then
+	v = "1.0"
+    elseif version == "HTTP/1.1" then
+	v = "1.1"
+    elseif version == "HTTP/2.0" then
+	v = "2.0"
+    end
+
+    if not v then
+	return false, "Invalid version specified"
+    end
+
+    if msc.process_uri(self.transaction,url,method, v) ~= 1 then
+	return false, "Faild to process uri"
+    end
+
     return true
 end    
 
@@ -157,23 +177,33 @@ function _MT.eval_request_headers(self,headers)
     end
     
     for k,v in pairs(headers) do
-        msc.add_request_header(self.transaction,k,v)
+        if msc.add_request_header(self.transaction,k,v) ~= 1 then
+	   return false, "Failed to add request header"
+	end
     end
     
-    msc.process_request_headers(self.transaction)
-    
+    if msc.process_request_headers(self.transaction) ~= 1 then
+	return false, "Failed to process request headers"
+    end
+
     return true
 end
     
 function _MT.eval_request_body(self,body,is_file)
     if is_file then
-        msc.request_body_from_file(body)
+        if msc.request_body_from_file(self.transaction,body) ~= 1 then
+	   return false, "Failed to set request body from file"
+	end
     else
-        msc.append_request_body(body)
+        if msc.append_request_body(self,transaction,body,#body) ~= 1 then
+	   return false, "Failed to set request body"
+	end
     end
     
-    msc.process_request_body(self.transaction)
-    
+    if msc.process_request_body(self.transaction) ~= 1 then
+	return false, "Failed to process request body"
+    end
+
     return true
 end    
 
@@ -183,18 +213,35 @@ function _MT.eval_response_headers(self,headers,status,version)
     end
     
     for k,v in pairs(headers) do
-        msc.add_response_header(self.transaction,k,v)
+	if type(v) == "table" then
+	   for _,cookie in pairs(v) do
+		if msc.add_response_header(self.transaction,k,cookie) ~= 1 then
+		   return false, "Failed to add response header"
+		end
+	   end
+	else
+	   if msc.add_response_header(self.transaction,k,v) ~= 1 then
+		return false, "Failed to add response header"
+	   end
+	end
     end
     
-    msc.process_response_headers(self.transaction, status, version)
-    
+    if msc.process_response_headers(self.transaction, status, version) ~= 1 then
+	return false, "Failed to process response header"
+    end
+
     return true
 end
 
 function _MT.eval_response_body(self,body)
-    msc.append_response_body(self.ransaction,body)
-    msc.process_response_body(self.transaction)
-    
+    if msc.append_response_body(self.ransaction,body) ~= 1 then
+	return false, "Failed to append response body"
+    end
+
+    if msc.process_response_body(self.transaction) ~= 1 then
+	return false, "Failed to process response body"
+    end
+
     return true
 end    
     
@@ -209,7 +256,7 @@ function _M.transaction()
     end
     
     ffi.gc(ret.transaction,msc.transaction_cleanup)
-    setmetatable(ret,{ __index = MT } )
+    setmetatable(ret,{ __index = _MT } )
 
     return ret
 end    
