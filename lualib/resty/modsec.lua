@@ -12,10 +12,6 @@ local error             = error
 local setmetatable      = setmetatable
 local subsystem         = ngx.config.subsystem
 
---local settings          = require "settings"
-
---local ngx_lua_ffi_get_ctx_ref
-
 local _M  = {}
 local _MT = {}
 local msc = {}
@@ -82,6 +78,13 @@ if subsystem == "http" then
         void msc_rules_dump(RulesSet *rules);
     ]]
     
+    local clib = ffi.load("/usr/local/modsecurity/lib/libmodsecurity.so",true)
+    
+    if not clib then
+	ngx.log(ngx.ERR,"Failed to open modsecurity library")
+	return nil
+    end
+
     msc = {
         transaction_variable                    = C.msc_get_transaction_variable,
         highest_severity                        = C.msc_get_highest_severity,
@@ -117,7 +120,7 @@ elseif subsystem == "stream" then
     -- nothing to be done here
 end
 
-local modesec    
+local modsec    
 local rules
     
 -- Modsecurity is separate ecosystem with it's own variables
@@ -131,15 +134,18 @@ local rules
 -- bindings to modsecurity functions and decide whether to test request or not
     
 function _MT.variable(self,var_name)
+    if not self.transaction then
+       return nil, "Transaction not initialized"
+    end
 
-    if not self.transaction or not var_name then
-       return nil 
+    if not var_name then
+       return nil, "Variable name empty"
     end
             
     local var = msc.transaction_variable(self.transaction,var_name)
         
     if var == nil then
-        return nil
+        return nil, "Variable does not exists"
     end
         
     return ffi.string(var)
