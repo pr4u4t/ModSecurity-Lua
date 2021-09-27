@@ -76,6 +76,8 @@ if subsystem == "http" then
         int msc_rules_add_file(RulesSet *rules, const char *file, const char **error);
              
         void msc_rules_dump(RulesSet *rules);
+             
+        int msc_process_logging(Transaction *transaction);
     ]]
     
     local clib = ffi.load("/usr/local/modsecurity/lib/libmodsecurity.so",true)
@@ -113,7 +115,8 @@ if subsystem == "http" then
         rules_cleanup                           = C.msc_rules_cleanup,
         rules_add_remote                        = C.msc_rules_add_remote,
         rules_add_file                          = C.msc_rules_add_file,
-        rules_dump                              = C.msc_rules_dump
+        rules_dump                              = C.msc_rules_dump,
+        process_logging                         = C.msc_process_logging
     }    
     
 elseif subsystem == "stream" then
@@ -154,24 +157,24 @@ end
 function _MT.eval_connection(self,client_ip,client_port,host,port,url,method,version)
     
     if msc.process_connection(self.transaction, client_ip, tonumber(client_port), host, tonumber(port)) ~= 1 then
-	return false, "Failed to process connection"
+        return false, "Failed to process connection"
     end
     
     local v = nil
     if version == "HTTP/1.0" then
-	v = "1.0"
+        v = "1.0"
     elseif version == "HTTP/1.1" then
-	v = "1.1"
+        v = "1.1"
     elseif version == "HTTP/2.0" then
-	v = "2.0"
+        v = "2.0"
     end
 
     if not v then
-	return false, "Invalid version specified"
+        return false, "Invalid version specified"
     end
 
     if msc.process_uri(self.transaction,url,method, v) ~= 1 then
-	return false, "Faild to process uri"
+        return false, "Failed to process uri"
     end
 
     return true
@@ -184,12 +187,12 @@ function _MT.eval_request_headers(self,headers)
     
     for k,v in pairs(headers) do
         if msc.add_request_header(self.transaction,k,v) ~= 1 then
-	   return false, "Failed to add request header"
-	end
+            return false, "Failed to add request header"
+        end
     end
     
     if msc.process_request_headers(self.transaction) ~= 1 then
-	return false, "Failed to process request headers"
+        return false, "Failed to process request headers"
     end
 
     return true
@@ -198,16 +201,16 @@ end
 function _MT.eval_request_body(self,body,is_file)
     if is_file then
         if msc.request_body_from_file(self.transaction,body) ~= 1 then
-	   return false, "Failed to set request body from file"
-	end
+            return false, "Failed to set request body from file"
+        end
     else
         if msc.append_request_body(self,transaction,body,#body) ~= 1 then
-	   return false, "Failed to set request body"
-	end
+            return false, "Failed to set request body"
+        end
     end
     
     if msc.process_request_body(self.transaction) ~= 1 then
-	return false, "Failed to process request body"
+        return false, "Failed to process request body"
     end
 
     return true
@@ -219,21 +222,21 @@ function _MT.eval_response_headers(self,headers,status,version)
     end
     
     for k,v in pairs(headers) do
-	if type(v) == "table" then
-	   for _,cookie in pairs(v) do
-		if msc.add_response_header(self.transaction,k,cookie) ~= 1 then
-		   return false, "Failed to add response header"
-		end
-	   end
-	else
-	   if msc.add_response_header(self.transaction,k,v) ~= 1 then
-		return false, "Failed to add response header"
-	   end
-	end
+        if type(v) == "table" then
+            for _,cookie in pairs(v) do
+                if msc.add_response_header(self.transaction,k,cookie) ~= 1 then
+                    return false, "Failed to add response header"
+                end
+            end
+        else
+            if msc.add_response_header(self.transaction,k,v) ~= 1 then
+                return false, "Failed to add response header"
+            end
+        end
     end
     
     if msc.process_response_headers(self.transaction, status, version) ~= 1 then
-	return false, "Failed to process response header"
+        return false, "Failed to process response header"
     end
 
     return true
@@ -241,17 +244,24 @@ end
 
 function _MT.eval_response_body(self,body)
     if msc.append_response_body(self.ransaction,body) ~= 1 then
-	return false, "Failed to append response body"
+        return false, "Failed to append response body"
     end
 
     if msc.process_response_body(self.transaction) ~= 1 then
-	return false, "Failed to process response body"
+        return false, "Failed to process response body"
     end
 
     return true
 end    
     
---msc.process_logging(transaction)
+local function clean_transaction(transaction)
+    if not transaction then
+        return
+    end
+    
+    msc.process_logging(transaction)
+    msc.transaction_cleanup(transaction)
+end
     
 function _M.transaction()
     local ret = {}
@@ -261,7 +271,7 @@ function _M.transaction()
         return nil
     end
     
-    ffi.gc(ret.transaction,msc.transaction_cleanup)
+    ffi.gc(ret.transaction,clean_transaction)
     setmetatable(ret,{ __index = _MT } )
 
     return ret
@@ -269,7 +279,7 @@ end
     
 function _M.init(rules_file)
     if modsec and rules then
-	return true
+        return true
     end
 
     if not rules_file then
