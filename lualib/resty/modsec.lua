@@ -15,13 +15,15 @@ local subsystem         = ngx.config.subsystem
 local _M  = {}
 local _MT = {}
 local msc = {}
+local _DEBUG = true
 
 if subsystem == "http" then
     ffi.cdef[[
         typedef void ModSecurity;
         typedef void Transaction;
         typedef void RulesSet;      
-              
+        typedef void (*ModSecLogCb) (void *, const void *);
+             
         const char *msc_get_transaction_variable(Transaction *transaction, const char *var_name);
              
         int msc_get_highest_severity(Transaction *transaction);
@@ -74,10 +76,15 @@ if subsystem == "http" then
                                     const char **error);
              
         int msc_rules_add_file(RulesSet *rules, const char *file, const char **error);
+        
+        int msc_rules_add(RulesSet *rules, const char *plain_rules,
+                               const char **error);
              
         void msc_rules_dump(RulesSet *rules);
              
         int msc_process_logging(Transaction *transaction);
+             
+        void msc_set_log_cb(ModSecurity *msc, ModSecLogCb cb);
     ]]
     
     local clib = ffi.load("/usr/local/modsecurity/lib/libmodsecurity.so",true)
@@ -115,8 +122,10 @@ if subsystem == "http" then
         rules_cleanup                           = C.msc_rules_cleanup,
         rules_add_remote                        = C.msc_rules_add_remote,
         rules_add_file                          = C.msc_rules_add_file,
+        rules_add_inline                        = C.msc_rules_add,
         rules_dump                              = C.msc_rules_dump,
-        process_logging                         = C.msc_process_logging
+        process_logging                         = C.msc_process_logging,
+        msc_set_log_cb                          = C.msc_set_log_cb
     }    
     
 elseif subsystem == "stream" then
@@ -135,7 +144,19 @@ local rules
 
 -- UPDATE: existing nginx connector doesn't give flexibility only solution is to prepare lua
 -- bindings to modsecurity functions and decide whether to test request or not
+
+local function httpVersion(version)
+    if version == "HTTP/1.0" then
+        return "1.0"
+    elseif version == "HTTP/1.1" then
+        return "1.1"
+    elseif version == "HTTP/2.0" then
+        return "2.0"
+    end
     
+    return nil
+end    
+
 function _MT.variable(self,var_name)
     if not self.transaction then
        return nil, "Transaction not initialized"
@@ -160,15 +181,8 @@ function _MT.eval_connection(self,client_ip,client_port,host,port,url,method,ver
         return false, "Failed to process connection"
     end
     
-    local v = nil
-    if version == "HTTP/1.0" then
-        v = "1.0"
-    elseif version == "HTTP/1.1" then
-        v = "1.1"
-    elseif version == "HTTP/2.0" then
-        v = "2.0"
-    end
-
+    local v = httpVersion(version)
+   
     if not v then
         return false, "Invalid version specified"
     end
@@ -181,13 +195,11 @@ function _MT.eval_connection(self,client_ip,client_port,host,port,url,method,ver
 end    
 
 function _MT.eval_request_headers(self,headers)
-    if type(headers) ~= "table" then
-        return false
-    end
-    
-    for k,v in pairs(headers) do
-        if msc.add_request_header(self.transaction,k,v) ~= 1 then
-            return false, "Failed to add request header"
+    if type(headers) == "table" then
+        for k,v in pairs(headers) do
+            if msc.add_request_header(self.transaction,k,v) ~= 1 then
+                return false, "Failed to add request header"
+            end
         end
     end
     
@@ -199,13 +211,15 @@ function _MT.eval_request_headers(self,headers)
 end
     
 function _MT.eval_request_body(self,body,is_file)
-    if is_file then
-        if msc.request_body_from_file(self.transaction,body) ~= 1 then
-            return false, "Failed to set request body from file"
-        end
-    else
-        if msc.append_request_body(self,transaction,body,#body) ~= 1 then
-            return false, "Failed to set request body"
+    if body then
+        if is_file then
+            if msc.request_body_from_file(self.transaction,body) ~= 1 then
+                return false, "Failed to set request body from file"
+            end
+        else
+            if msc.append_request_body(self,transaction,body,#body) ~= 1 then
+                return false, "Failed to set request body"
+            end
         end
     end
     
@@ -216,74 +230,91 @@ function _MT.eval_request_body(self,body,is_file)
     return true
 end    
 
-function _MT.eval_response_headers(self,headers,status,version)
-    if type(headers) ~= "table" then
-        return false
+function _MT.eval_response_headers(self,headers,status,version,code)
+    if type(status) == "string" and type(version) == "string" and type(code) == "string" then
+        msc.add_response_header(status,code);
     end
     
-    for k,v in pairs(headers) do
-        if type(v) == "table" then
-            for _,cookie in pairs(v) do
-                if msc.add_response_header(self.transaction,k,cookie) ~= 1 then
+    if type(headers) == "table" then
+        
+        
+        for k,v in pairs(headers) do
+            if type(v) == "table" then
+                for _,cookie in pairs(v) do
+                    if msc.add_response_header(self.transaction,k,cookie) ~= 1 then
+                        return false, "Failed to add response header"
+                    end
+                end
+            else
+                if msc.add_response_header(self.transaction,k,v) ~= 1 then
                     return false, "Failed to add response header"
                 end
-            end
-        else
-            if msc.add_response_header(self.transaction,k,v) ~= 1 then
-                return false, "Failed to add response header"
             end
         end
     end
     
-    if msc.process_response_headers(self.transaction, status, version) ~= 1 then
-        return false, "Failed to process response header"
+    if msc.process_response_headers(self.transaction, status, 'HTTP '.. httpVersion(version)) ~= 1 then
+        return false, "Failed to process response headers"
     end
 
     return true
 end
 
 function _MT.eval_response_body(self,body)
-    if msc.append_response_body(self.ransaction,body) ~= 1 then
-        return false, "Failed to append response body"
+    if body then
+        if msc.append_response_body(self.transaction,body) ~= 1 then
+            return false, "Failed to append response body"
+        end
+    else
+        if msc.process_response_body(self.transaction) ~= 1 then
+            return false, "Failed to process response body"
+        end
     end
-
-    if msc.process_response_body(self.transaction) ~= 1 then
-        return false, "Failed to process response body"
-    end
-
+    
     return true
 end    
-    
-local function clean_transaction(transaction)
-    if not transaction then
-        return
-    end
-    
-    msc.process_logging(transaction)
-    msc.transaction_cleanup(transaction)
+
+function _MT.store(self)
+    ngx.ctx.transaction = self.transaction
 end
-    
+
+local function transaction_logging(data,msg)
+    local str = ffi.string(msg)
+    ngx.log(ngx.ERR,str)
+end
+
+function _MT.logging(self)
+    return msc.process_logging(self.transaction)
+end
+
 function _M.transaction()
     local ret = {}
-    ret.transaction = msc.new_transaction(modsec, rules, nil);
+    
+    if ngx.ctx.transaction then
+        ret.transaction = ngx.ctx.transaction
+    else
+        ret.transaction = msc.new_transaction(modsec, rules, nil)
+        ffi.gc(ret.transaction,msc.transaction_cleanup)
+    end
     
     if not ret.transaction then
         return nil
     end
     
-    ffi.gc(ret.transaction,clean_transaction)
     setmetatable(ret,{ __index = _MT } )
-
+    
     return ret
 end    
     
-function _M.init(rules_file)
+function _M.init(rules_file,rules_remote,rules_inline,remote_key)
+    local res
+    
     if modsec and rules then
         return true
     end
 
-    if not rules_file then
-       return false, "Rules file path should not be empty"
+    if not rules_file and not rules_remote and not rules_inline then
+       return false, "Rules file path/url/inline should not be empty"
     end
     
     -- initialize libmodsecurity and set garbage collect function
@@ -295,6 +326,7 @@ function _M.init(rules_file)
 
     ffi.gc(modsec,msc.cleanup)
     msc.set_connector_info(modsec, "ModSecurity LUA")
+    msc.msc_set_log_cb(modsec,transaction_logging);
     
     -- initialize new rules set and set garbage collect function
     rules = msc.create_rules_set()
@@ -307,13 +339,39 @@ function _M.init(rules_file)
     
     -- 
     local err = ffi.new 'const char *[1]'
-    local ret = msc.rules_add_file(rules, rules_file, err)
     
-    if ret < 0 then
-        return false, err[1]
+    if type(rules_file) == "string" then
+        res = msc.rules_add_file(rules, rules_file, err)
+    
+        if res < 0 then
+            ngx.log(ngx.ERR,"Failed to load rules", ffi.string(err[0]))
+            return false, ffi.string(err[0])
+        end
     end
     
-    msc.rules_dump(rules)
+    if type(rules_remote) == "string" then
+        res = msc.rules_add_remote(rules, remote_key, rules_remote, err)
+        
+        if res < 0 then
+            ngx.log(ngx.ERR,"Failed to load rules", ffi.string(err[0]))
+            return false, ffi.string(err[0])
+        end
+    end
+    
+    if type(rules_inline) == "string" then
+        res = msc.rules_add_inline(rules, rules_inline, err)
+        
+        if res < 0 then
+            ngx.log(ngx.ERR,"Failed to load rules", ffi.string(err[0]))
+            return false, ffi.string(err[0])
+        end
+    end
+    
+    ngx.log(ngx.ERR,"Loaded #"..res.." rules from file")
+    
+    if _DEBUG then
+        msc.rules_dump(rules)
+    end
     
     return true
 end    
