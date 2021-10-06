@@ -217,7 +217,7 @@ function _MT.eval_request_body(self,body,is_file)
                 return false, "Failed to set request body from file"
             end
         else
-            if msc.append_request_body(self,transaction,body,#body) ~= 1 then
+            if msc.append_request_body(self.transaction,body,#body) ~= 1 then
                 return false, "Failed to set request body"
             end
         end
@@ -260,7 +260,7 @@ end
 
 function _MT.eval_response_body(self,body)
     if body then
-        if msc.append_response_body(self.transaction,body) ~= 1 then
+        if msc.append_response_body(self.transaction,body,#body) ~= 1 then
             return false, "Failed to append response body"
         end
     else
