@@ -236,8 +236,6 @@ function _MT.eval_response_headers(self,headers,status,version,code)
     end
     
     if type(headers) == "table" then
-        
-        
         for k,v in pairs(headers) do
             if type(v) == "table" then
                 for _,cookie in pairs(v) do

@@ -1,7 +1,10 @@
 ### ModSecurity-Lua
 
 This is libmodsecurity binding for lua, created as a replacement for modsecurity nginx connector to be used with 
-openresty. The purpose of this binding is to give read access to libmodsecurity variables to openresty.
+openresty. The purpose of this binding is to give read access to libmodsecurity variables to openresty. To have access 
+to libmodsecurity transaction variables libmodsecurity must be patched with 
+
+Simple example:
 
 ```lua
 
@@ -82,3 +85,4 @@ transaction:logging()
 
 ```
 
+Real life example:
