@@ -1,6 +1,7 @@
 local ffi               = require "ffi"
 local debug             = require "debug"
-local base              = require "resty.core.base" 
+local base              = require "resty.core.base"
+
 local C                 = ffi.C
 local registry          = debug.getregistry()
 local new_tab           = base.new_tab
@@ -13,9 +14,8 @@ local setmetatable      = setmetatable
 local subsystem         = ngx.config.subsystem
 
 local _M  = {}
-local _MT = {}
 local msc = {}
-local _DEBUG = true
+local _DEBUG = false
 
 if subsystem == "http" then
     ffi.cdef[[
@@ -87,11 +87,14 @@ if subsystem == "http" then
         void msc_set_log_cb(ModSecurity *msc, ModSecLogCb cb);
     ]]
     
-    local clib = ffi.load("/usr/local/modsecurity/lib/libmodsecurity.so",true)
+    local ok, clib = pcall(ffi.load,"modsecurity",true)
     
-    if not clib then
-	ngx.log(ngx.ERR,"Failed to open modsecurity library")
-	return nil
+    if not ok then
+        ok, clib = pcall(ffi.load,"/usr/local/modsecurity/lib/libmodsecurity.so",true)
+        if not ok then
+            ngx.log(ngx.ERR,"Failed to open modsecurity library")
+            return nil
+        end
     end
 
     msc = {
@@ -130,20 +133,12 @@ if subsystem == "http" then
     
 elseif subsystem == "stream" then
     -- nothing to be done here
+    ngx.log(ngx.ERR, "Currently not supported")
+    return nil
 end
 
 local modsec    
 local rules
-    
--- Modsecurity is separate ecosystem with it's own variables
--- deduction about blocking a request using HighestSeverity action often results 
--- in false positives. Making a separate function for every variable possible to set 
--- in rules is impossible. To make a proper deduction a gap between modescurity <-> nginx_connector 
--- must be filled. Best solution for that is make transaction export to Lua. This solution is based 
--- on ngx_mod_lua. Of course this needs one extra ModSec nginx connector function.
-
--- UPDATE: existing nginx connector doesn't give flexibility only solution is to prepare lua
--- bindings to modsecurity functions and decide whether to test request or not
 
 local function httpVersion(version)
     if version == "HTTP/1.0" then
@@ -157,149 +152,170 @@ local function httpVersion(version)
     return nil
 end    
 
-function _MT.variable(self,var_name)
-    if not self.transaction then
-       return nil, "Transaction not initialized"
-    end
-
-    if not var_name then
-       return nil, "Variable name empty"
-    end
-            
-    local var = msc.transaction_variable(self.transaction,var_name)
-        
-    if var == nil then
-        return nil, "Variable does not exists"
-    end
-        
-    return ffi.string(var)
-end
-
-function _MT.eval_connection(self,client_ip,client_port,host,port,url,method,version)
-    
-    if msc.process_connection(self.transaction, client_ip, tonumber(client_port), host, tonumber(port)) ~= 1 then
-        return false, "Failed to process connection"
-    end
-    
-    local v = httpVersion(version)
-   
-    if not v then
-        return false, "Invalid version specified"
-    end
-
-    if msc.process_uri(self.transaction,url,method, v) ~= 1 then
-        return false, "Failed to process uri"
-    end
-
-    return true
-end    
-
-function _MT.eval_request_headers(self,headers)
-    if type(headers) == "table" then
-        for k,v in pairs(headers) do
-            if msc.add_request_header(self.transaction,k,v) ~= 1 then
-                return false, "Failed to add request header"
-            end
-        end
-    end
-    
-    if msc.process_request_headers(self.transaction) ~= 1 then
-        return false, "Failed to process request headers"
-    end
-
-    return true
-end
-    
-function _MT.eval_request_body(self,body,is_file)
-    if body then
-        if is_file then
-            if msc.request_body_from_file(self.transaction,body) ~= 1 then
-                return false, "Failed to set request body from file"
-            end
-        else
-            if msc.append_request_body(self.transaction,body,#body) ~= 1 then
-                return false, "Failed to set request body"
-            end
-        end
-    end
-    
-    if msc.process_request_body(self.transaction) ~= 1 then
-        return false, "Failed to process request body"
-    end
-
-    return true
-end    
-
-function _MT.eval_response_headers(self,headers,status,version,code)
-    if type(status) == "string" and type(version) == "string" and type(code) == "string" then
-        msc.add_response_header(status,code);
-    end
-    
-    if type(headers) == "table" then
-        for k,v in pairs(headers) do
-            if type(v) == "table" then
-                for _,cookie in pairs(v) do
-                    if msc.add_response_header(self.transaction,k,cookie) ~= 1 then
-                        return false, "Failed to add response header"
-                    end
-                end
-            else
-                if msc.add_response_header(self.transaction,k,v) ~= 1 then
-                    return false, "Failed to add response header"
-                end
-            end
-        end
-    end
-    
-    if msc.process_response_headers(self.transaction, status, 'HTTP '.. httpVersion(version)) ~= 1 then
-        return false, "Failed to process response headers"
-    end
-
-    return true
-end
-
-function _MT.eval_response_body(self,body)
-    if body then
-        if msc.append_response_body(self.transaction,body,#body) ~= 1 then
-            return false, "Failed to append response body"
-        end
-    else
-        if msc.process_response_body(self.transaction) ~= 1 then
-            return false, "Failed to process response body"
-        end
-    end
-    
-    return true
-end    
-
-function _MT.store(self)
-    ngx.ctx.transaction = self.transaction
-end
-
 local function transaction_logging(data,msg)
     local str = ffi.string(msg)
     ngx.log(ngx.ERR,str)
 end
 
-function _MT.logging(self)
-    return msc.process_logging(self.transaction)
-end
-
 function _M.transaction()
     local ret = {}
+    local _MT = {}
+    local data
     
     if ngx.ctx.transaction then
-        ret.transaction = ngx.ctx.transaction
+        data = ngx.ctx.transaction
     else
-        ret.transaction = msc.new_transaction(modsec, rules, nil)
-        ffi.gc(ret.transaction,msc.transaction_cleanup)
+        data = msc.new_transaction(modsec, rules, nil)
+        ffi.gc(data,msc.transaction_cleanup)
     end
-    
-    if not ret.transaction then
+
+    if not data then
         return nil
     end
+
+    -- Create methods being closures 
+    function _MT.variable(self,var_name)
+        if not data then
+            return nil, "Transaction not initialized"
+        end
+        
+        if not var_name then
+            return nil, "Variable name empty"
+        end
+        
+        local var = msc.transaction_variable(data,var_name)
+        
+        if var == nil then
+            return nil, "Variable does not exists"
+        end
+        
+        return ffi.string(var)
+    end
     
-    setmetatable(ret,{ __index = _MT } )
+    function _MT.eval_connection(self,client_ip,client_port,host,port,url,method,version)
+        
+        if msc.process_connection(data, client_ip, tonumber(client_port), host, tonumber(port)) ~= 1 then
+            return false, "Failed to process connection"
+        end
+        
+        local v = httpVersion(version)
+        
+        if not v then
+            return false, "Invalid version specified"
+        end
+        
+        if msc.process_uri(data,url,method, v) ~= 1 then
+            return false, "Failed to process uri"
+        end
+        
+        return true
+    end    
+    
+    function _MT.eval_request_headers(self,headers)
+        if type(headers) == "table" then
+            for k,v in pairs(headers) do
+                if msc.add_request_header(data,k,v) ~= 1 then
+                    return false, "Failed to add request header"
+                end
+            end
+        end
+        
+        if msc.process_request_headers(data) ~= 1 then
+            return false, "Failed to process request headers"
+        end
+        
+        return true
+    end
+    
+    function _MT.eval_request_body(self,body,is_file)
+        if body then
+            if is_file then
+                if msc.request_body_from_file(data,body) ~= 1 then
+                    return false, "Failed to set request body from file"
+                end
+            else
+                if msc.append_request_body(data,body,#body) ~= 1 then
+                    return false, "Failed to set request body"
+                end
+            end
+        end
+        
+        if msc.process_request_body(data) ~= 1 then
+            return false, "Failed to process request body"
+        end
+        
+        return true
+    end    
+    
+    function _MT.eval_response_headers(self,headers,status,version,code)
+        if type(status) == "string" and type(version) == "string" and type(code) == "string" then
+            msc.add_response_header(data,status,code);
+        end
+        
+        if type(headers) == "table" then
+            for k,v in pairs(headers) do
+                if type(v) == "table" then
+                    for _,cookie in pairs(v) do
+                        if msc.add_response_header(data,k,cookie) ~= 1 then
+                            return false, "Failed to add response header"
+                        end
+                    end
+                else
+                    if msc.add_response_header(data,k,v) ~= 1 then
+                        return false, "Failed to add response header"
+                    end
+                end
+            end
+        end
+        
+        if msc.process_response_headers(data, status, 'HTTP '.. httpVersion(version)) ~= 1 then
+            return false, "Failed to process response headers"
+        end
+        
+        return true
+    end
+    
+    function _MT.eval_response_body(self,body)
+        if body then
+            if msc.append_response_body(data,body,#body) ~= 1 then
+                return false, "Failed to append response body"
+            end
+        else
+            if msc.process_response_body(data) ~= 1 then
+                return false, "Failed to process response body"
+            end
+        end
+        
+        return true
+    end    
+    
+    function _MT.store(self)
+        ngx.ctx.transaction = data
+    end
+    
+    function _MT.logging(self)
+        return msc.process_logging(data)
+    end
+    
+    setmetatable(ret, { __index = _MT } )
+    
+    -- Create vars access table
+    
+    ret.var = {
+        global      = {},
+        ip          = {},
+        session     = {},
+        user        = {},
+        resource    = {},
+        tx          = {}
+    }   
+    
+    setmetatable(ret.var.global, { __index = function(t,k) return _MT.variable(nil,'global:'..k) end } )
+    setmetatable(ret.var.ip, { __index = function(t,k) return _MT.variable(nil,'ip:'..k) end } )
+    setmetatable(ret.var.session, { __index = function(t,k) return _MT.variable(nil,'session:'..k) end } )
+    setmetatable(ret.var.user, { __index = function(t,k) return _MT.variable(nil,'user:'..k) end } )
+    setmetatable(ret.var.resource, { __index = function(t,k) return _MT.variable(nil,'resource:'..k) end } )
+    setmetatable(ret.var.tx, { __index = function(t,k) return _MT.variable(nil,'tx:'..k) end } )
     
     return ret
 end    
