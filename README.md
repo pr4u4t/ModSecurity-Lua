@@ -4,6 +4,9 @@ This is libmodsecurity binding for lua, created as a replacement for modsecurity
 openresty. The purpose of this binding is to give read access to libmodsecurity variables to openresty. To have access 
 to libmodsecurity transaction variables libmodsecurity must be patched with 
 
+### To Use This Binding libmodsecurity must be patched with:
+[pull style API](https://github.com/SpiderLabs/ModSecurity/pull/2620)
+
 Simple example:
 
 ```lua
